@@ -6,10 +6,12 @@ and implement the required methods.
 """
 
 import asyncio
+import ipaddress
 import logging
 import os
 import random
 import re
+import socket as _socket
 import subprocess
 import sys
 import uuid
@@ -17,6 +19,41 @@ from abc import ABC, abstractmethod
 from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
+
+
+def is_network_accessible(host: str) -> bool:
+    """Return True if *host* would expose the server beyond loopback.
+
+    Loopback addresses (127.0.0.1, ::1, IPv4-mapped ::ffff:127.0.0.1)
+    are local-only.  Unspecified addresses (0.0.0.0, ::) bind all
+    interfaces.  Hostnames are resolved; DNS failure fails closed.
+    """
+    try:
+        addr = ipaddress.ip_address(host)
+        if addr.is_loopback:
+            return False
+        # ::ffff:127.0.0.1 — Python reports is_loopback=False for mapped
+        # addresses, so check the underlying IPv4 explicitly.
+        if getattr(addr, "ipv4_mapped", None) and addr.ipv4_mapped.is_loopback:
+            return False
+        return True
+    except ValueError:
+        # when host variable is a hostname, we should try to resolve below
+        pass
+
+    try:
+        resolved = _socket.getaddrinfo(
+            host, None, _socket.AF_UNSPEC, _socket.SOCK_STREAM,
+        )
+        # if the hostname resolves into at least one non-loopback address,
+        # then we consider it to be network accessible
+        for _family, _type, _proto, _canonname, sockaddr in resolved:
+            addr = ipaddress.ip_address(sockaddr[0])
+            if not addr.is_loopback:
+                return True
+        return False
+    except (_socket.gaierror, OSError):
+        return True
 
 
 def _detect_macos_system_proxy() -> str | None:
@@ -160,7 +197,7 @@ GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE = (
 )
 
 
-def _safe_url_for_log(url: str, max_len: int = 80) -> str:
+def safe_url_for_log(url: str, max_len: int = 80) -> str:
     """Return a URL string safe for logs (no query/fragment/userinfo)."""
     if max_len <= 0:
         return ""
@@ -195,6 +232,23 @@ def _safe_url_for_log(url: str, max_len: int = 80) -> str:
     if max_len <= 3:
         return "." * max_len
     return f"{safe[:max_len - 3]}..."
+
+
+async def _ssrf_redirect_guard(response):
+    """Re-validate each redirect target to prevent redirect-based SSRF.
+
+    Without this, an attacker can host a public URL that 302-redirects to
+    http://169.254.169.254/ and bypass the pre-flight is_safe_url() check.
+
+    Must be async because httpx.AsyncClient awaits response event hooks.
+    """
+    if response.is_redirect and response.next_request:
+        redirect_url = str(response.next_request.url)
+        from tools.url_safety import is_safe_url
+        if not is_safe_url(redirect_url):
+            raise ValueError(
+                f"Blocked redirect to private/internal address: {safe_url_for_log(redirect_url)}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -281,7 +335,7 @@ async def cache_image_from_url(url: str, ext: str = ".jpg", retries: int = 2) ->
     """
     from tools.url_safety import is_safe_url
     if not is_safe_url(url):
-        raise ValueError(f"Blocked unsafe URL (SSRF protection): {_safe_url_for_log(url)}")
+        raise ValueError(f"Blocked unsafe URL (SSRF protection): {safe_url_for_log(url)}")
 
     import asyncio
     import httpx
@@ -289,7 +343,11 @@ async def cache_image_from_url(url: str, ext: str = ".jpg", retries: int = 2) ->
     _log = _logging.getLogger(__name__)
 
     last_exc = None
-    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+    async with httpx.AsyncClient(
+        timeout=30.0,
+        follow_redirects=True,
+        event_hooks={"response": [_ssrf_redirect_guard]},
+    ) as client:
         for attempt in range(retries + 1):
             try:
                 response = await client.get(
@@ -311,7 +369,7 @@ async def cache_image_from_url(url: str, ext: str = ".jpg", retries: int = 2) ->
                         "Media cache retry %d/%d for %s (%.1fs): %s",
                         attempt + 1,
                         retries,
-                        _safe_url_for_log(url),
+                        safe_url_for_log(url),
                         wait,
                         exc,
                     )
@@ -396,7 +454,7 @@ async def cache_audio_from_url(url: str, ext: str = ".ogg", retries: int = 2) ->
     """
     from tools.url_safety import is_safe_url
     if not is_safe_url(url):
-        raise ValueError(f"Blocked unsafe URL (SSRF protection): {_safe_url_for_log(url)}")
+        raise ValueError(f"Blocked unsafe URL (SSRF protection): {safe_url_for_log(url)}")
 
     import asyncio
     import httpx
@@ -404,7 +462,11 @@ async def cache_audio_from_url(url: str, ext: str = ".ogg", retries: int = 2) ->
     _log = _logging.getLogger(__name__)
 
     last_exc = None
-    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+    async with httpx.AsyncClient(
+        timeout=30.0,
+        follow_redirects=True,
+        event_hooks={"response": [_ssrf_redirect_guard]},
+    ) as client:
         for attempt in range(retries + 1):
             try:
                 response = await client.get(
@@ -426,7 +488,7 @@ async def cache_audio_from_url(url: str, ext: str = ".ogg", retries: int = 2) ->
                         "Audio cache retry %d/%d for %s (%.1fs): %s",
                         attempt + 1,
                         retries,
-                        _safe_url_for_log(url),
+                        safe_url_for_log(url),
                         wait,
                         exc,
                     )
@@ -564,8 +626,9 @@ class MessageEvent:
     reply_to_message_id: Optional[str] = None
     reply_to_text: Optional[str] = None  # Text of the replied-to message (for context injection)
     
-    # Auto-loaded skill for topic/channel bindings (e.g., Telegram DM Topics)
-    auto_skill: Optional[str] = None
+    # Auto-loaded skill(s) for topic/channel bindings (e.g., Telegram DM Topics,
+    # Discord channel_skill_bindings).  A single name or ordered list.
+    auto_skill: Optional[str | list[str]] = None
     
     # Internal flag — set for synthetic events (e.g. background process
     # completion notifications) that must bypass user authorization checks.
@@ -587,6 +650,9 @@ class MessageEvent:
         raw = parts[0][1:].lower() if parts else None
         if raw and "@" in raw:
             raw = raw.split("@", 1)[0]
+        # Reject file paths: valid command names never contain /
+        if raw and "/" in raw:
+            return None
         return raw
     
     def get_command_args(self) -> str:
@@ -1525,7 +1591,7 @@ class BasePlatformAdapter(ABC):
                         logger.info(
                             "[%s] Sending image: %s (alt=%s)",
                             self.name,
-                            _safe_url_for_log(image_url),
+                            safe_url_for_log(image_url),
                             alt_text[:30] if alt_text else "",
                         )
                         # Route animated GIFs through send_animation for proper playback

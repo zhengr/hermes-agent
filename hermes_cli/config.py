@@ -39,6 +39,9 @@ _EXTRA_ENV_KEYS = frozenset({
     "DINGTALK_CLIENT_ID", "DINGTALK_CLIENT_SECRET",
     "FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_ENCRYPT_KEY", "FEISHU_VERIFICATION_TOKEN",
     "WECOM_BOT_ID", "WECOM_SECRET",
+    "WEIXIN_ACCOUNT_ID", "WEIXIN_TOKEN", "WEIXIN_BASE_URL", "WEIXIN_CDN_BASE_URL",
+    "WEIXIN_HOME_CHANNEL", "WEIXIN_HOME_CHANNEL_NAME", "WEIXIN_DM_POLICY", "WEIXIN_GROUP_POLICY",
+    "WEIXIN_ALLOWED_USERS", "WEIXIN_GROUP_ALLOWED_USERS", "WEIXIN_ALLOW_ALL_USERS",
     "BLUEBUBBLES_SERVER_URL", "BLUEBUBBLES_PASSWORD",
     "TERMINAL_ENV", "TERMINAL_SSH_KEY", "TERMINAL_SSH_PORT",
     "WHATSAPP_MODE", "WHATSAPP_ENABLED",
@@ -501,6 +504,16 @@ DEFAULT_CONFIG = {
         "max_ms": 2500,
     },
     
+    # Context engine -- controls how the context window is managed when
+    # approaching the model's token limit.
+    # "compressor" = built-in lossy summarization (default).
+    # Set to a plugin name to activate an alternative engine (e.g. "lcm"
+    # for Lossless Context Management).  The engine must be installed as
+    # a plugin in plugins/context_engine/<name>/ or ~/.hermes/plugins/.
+    "context": {
+        "engine": "compressor",
+    },
+
     # Persistent memory -- bounded curated memory injected into system prompt
     "memory": {
         "memory_enabled": True,
@@ -1206,8 +1219,8 @@ OPTIONAL_ENV_VARS = {
         "advanced": True,
     },
     "API_SERVER_KEY": {
-        "description": "Bearer token for API server authentication. If empty, all requests are allowed (local use only).",
-        "prompt": "API server auth key (optional)",
+        "description": "Bearer token for API server authentication. Required for non-loopback binding; server refuses to start without it. On loopback (127.0.0.1), all requests are allowed if empty.",
+        "prompt": "API server auth key (required for network access)",
         "url": None,
         "password": True,
         "category": "messaging",
@@ -1222,7 +1235,7 @@ OPTIONAL_ENV_VARS = {
         "advanced": True,
     },
     "API_SERVER_HOST": {
-        "description": "Host/bind address for the API server (default: 127.0.0.1). Use 0.0.0.0 for network access — requires API_SERVER_KEY for security.",
+        "description": "Host/bind address for the API server (default: 127.0.0.1). Use 0.0.0.0 for network access — server refuses to start without API_SERVER_KEY.",
         "prompt": "API server host",
         "url": None,
         "password": False,
@@ -1447,7 +1460,7 @@ _KNOWN_ROOT_KEYS = {
     "_config_version", "model", "providers", "fallback_model",
     "fallback_providers", "credential_pool_strategies", "toolsets",
     "agent", "terminal", "display", "compression", "delegation",
-    "auxiliary", "custom_providers", "memory", "gateway",
+    "auxiliary", "custom_providers", "context", "memory", "gateway",
 }
 
 # Valid fields inside a custom_providers list entry
